@@ -11,6 +11,8 @@
     "test:sanity:critical": "playwright test --grep @critical",
     "test:smoke": "playwright test --grep @smoke",
     "test:regression": "playwright test --grep @regression",
+    "test:gate:pass": "node scripts/test-gate-demo.mjs pass",
+    "test:gate:fail": "node scripts/test-gate-demo.mjs fail",
     "report:email": "node scripts/build-report.mjs results/results.json"
   },
   "dependencies": {

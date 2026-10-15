@@ -143,14 +143,14 @@ app.get('/', (req, res) => {
       <p class="hero-subtitle">High performance microservices deployed with automated post-deploy Playwright sanity gates.</p>
       
       <form action="/" method="GET" class="search-bar-form" role="search">
-        <input type="search" name="q" value="${q ? express.response.req.query.q : ''}" placeholder="Search products, hardware, devices..." aria-label="Search products" class="search-input" />
+        <input type="search" name="q" value="${q ? req.query.q : ''}" placeholder="Search products, hardware, devices..." aria-label="Search products" class="search-input" />
         <button type="submit" class="search-button">Search</button>
       </form>
     </section>
 
     <section class="products-section">
       <div class="section-header">
-        <h2>${q ? `Search Results for "${express.response.req.query.q}" (${filteredProducts.length})` : 'Featured Hardware & Cloud Gear'}</h2>
+        <h2>${q ? `Search Results for "${req.query.q}" (${filteredProducts.length})` : 'Featured Hardware & Cloud Gear'}</h2>
         <span class="catalog-badge">${filteredProducts.length} items available</span>
       </div>
 
@@ -186,7 +186,7 @@ app.get('/products', (req, res) => {
       <div class="section-header">
         <h2>Product Catalog</h2>
         <form action="/products" method="GET" class="search-bar-form-sm">
-          <input type="search" name="q" value="${q ? express.response.req.query.q : ''}" placeholder="Filter products..." aria-label="Search products" class="search-input-sm" />
+          <input type="search" name="q" value="${q ? req.query.q : ''}" placeholder="Filter products..." aria-label="Search products" class="search-input-sm" />
           <button type="submit" class="search-button-sm">Filter</button>
         </form>
       </div>

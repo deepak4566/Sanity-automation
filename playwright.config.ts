@@ -33,7 +33,7 @@ export default defineConfig({
   ...(!isExternalBaseUrl ? {
     webServer: {
       command: 'node src/server.js',
-      url: 'http://localhost:3000/api/health',
+      url: 'http://localhost:3000/',
       reuseExistingServer: !process.env.CI,
       timeout: 30_000,
     }
