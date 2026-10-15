@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "sanity": "playwright test --grep @sanity",
+    "sanity:critical": "playwright test --grep @critical",
     "report:email": "node scripts/build-report.mjs results/results.json"
   },
   "devDependencies": {

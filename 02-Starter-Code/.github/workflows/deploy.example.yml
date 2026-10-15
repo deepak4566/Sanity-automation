@@ -1,5 +1,6 @@
-# EXAMPLE ONLY — shows how to hook the sanity suite into your existing deploy workflow.
-# Copy the `sanity` job into your real deploy workflow (don't commit this file as-is).
+# EXAMPLE ONLY: how to hook the sanity suite into an EXISTING deploy workflow.
+# Copy the `sanity` job (and the `outputs`) into your real workflow; don't commit this file as-is.
+# Starting from scratch? Use ci-cd.yml instead.
 name: Deploy
 
 on:
@@ -32,4 +33,10 @@ jobs:
     with:
       environment: ${{ inputs.environment || 'qa' }}
       base_url: ${{ needs.deploy.outputs.url }}
+      ref: ${{ github.sha }}
     secrets: inherit
+
+  # ---- and gate whatever comes next on it ----
+  # promote:
+  #   needs: sanity
+  #   ...

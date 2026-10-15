@@ -2,7 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 const baseURL = process.env.BASE_URL;
 if (!baseURL) {
-  throw new Error('BASE_URL is not set. Set it as an env var or the environment variable BASE_URL in GitHub.');
+  throw new Error('BASE_URL is not set. Set it as an env var locally, or as the BASE_URL variable on the GitHub Environment.');
 }
 
 export default defineConfig({
@@ -10,7 +10,8 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: true,
-  retries: process.env.CI ? 1 : 0, // one retry to absorb post-deploy warm-up flakiness
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0, // one retry absorbs post-deploy warm-up flakiness
   workers: process.env.CI ? 4 : undefined,
   reporter: [
     ['list'],
@@ -22,7 +23,7 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
-    ignoreHTTPSErrors: true,
+    ignoreHTTPSErrors: true, // QA/dev often use internal certs; set to false if yours are valid
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
 });
