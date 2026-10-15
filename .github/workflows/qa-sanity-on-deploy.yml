@@ -1,0 +1,21 @@
+# OPTIONAL: Zero-touch trigger when you cannot edit the external deploy workflow.
+# Fires automatically when the specified workflow completes successfully.
+# Caveat: Because this triggers after the deployment workflow finishes, it cannot stop that
+# workflow's internal steps. The failing run + alert email serves as the incident notification.
+name: QA Sanity (After External Deploy)
+
+on:
+  workflow_run:
+    workflows: ["Deploy QA"] # Name of the target deploy workflow
+    types: [completed]
+
+jobs:
+  sanity:
+    if: github.event.workflow_run.conclusion == 'success'
+    uses: ./.github/workflows/post-deploy-sanity.yml
+    with:
+      environment: qa
+      test_suite: "@sanity"
+      suite_name: "Sanity"
+      ref: ${{ github.event.workflow_run.head_sha }}
+    secrets: inherit

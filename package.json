@@ -1,0 +1,24 @@
+{
+  "name": "qa-sanity-automation-demo",
+  "version": "1.0.0",
+  "description": "Post-Deploy QA Sanity, Daily Smoke, and Weekly Regression Automation Pipeline with GitHub Actions and Promotion Gate",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "playwright test",
+    "test:sanity": "playwright test --grep @sanity",
+    "test:sanity:critical": "playwright test --grep @critical",
+    "test:smoke": "playwright test --grep @smoke",
+    "test:regression": "playwright test --grep @regression",
+    "report:email": "node scripts/build-report.mjs results/results.json"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.1",
+    "@types/node": "^20.14.0"
+  }
+}

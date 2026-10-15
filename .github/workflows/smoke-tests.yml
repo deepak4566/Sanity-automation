@@ -1,0 +1,30 @@
+# Daily Smoke Tests Workflow
+# Runs daily (1-day cadence via cron) to verify baseline system health across primary user paths.
+name: Daily Smoke Tests
+
+on:
+  schedule:
+    # Runs daily at 06:00 UTC (every 24 hours / 1 day)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to test"
+        required: true
+        default: "qa"
+        type: choice
+        options: [dev, qa, staging, prod]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    name: Run Smoke Suite
+    uses: ./.github/workflows/post-deploy-sanity.yml
+    with:
+      environment: ${{ inputs.environment || 'qa' }}
+      test_suite: "@smoke"
+      suite_name: "Smoke"
+      ref: ${{ github.sha }}
+    secrets: inherit

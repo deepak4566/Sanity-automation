@@ -1,0 +1,191 @@
+name: Reusable Test Runner & Gate
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target deployment environment (dev / qa / staging / prod)"
+        required: true
+        type: string
+      base_url:
+        description: "Target URL to test. Falls back to environment BASE_URL variable or localhost."
+        required: false
+        type: string
+        default: ""
+      test_suite:
+        description: "Grep tag for Playwright (@sanity, @smoke, @regression)"
+        required: false
+        type: string
+        default: "@sanity"
+      suite_name:
+        description: "Human-readable test suite name (Sanity, Smoke, Regression)"
+        required: false
+        type: string
+        default: "Sanity"
+      ref:
+        description: "Commit SHA deployed"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      status:
+        description: "Test run outcome: PASS | FAIL | ERROR"
+        value: ${{ jobs.execute-suite.outputs.status }}
+      gate:
+        description: "Promotion gate decision: OPEN | BLOCKED"
+        value: ${{ jobs.execute-suite.outputs.gate }}
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "qa"
+        type: choice
+        options: [dev, qa, staging, prod]
+      base_url:
+        description: "Override URL (optional)"
+        required: false
+        default: ""
+      test_suite:
+        description: "Test tag to run"
+        required: true
+        default: "@sanity"
+        type: choice
+        options: ["@sanity", "@smoke", "@regression"]
+      suite_name:
+        description: "Suite name"
+        required: true
+        default: "Sanity"
+        type: choice
+        options: ["Sanity", "Smoke", "Regression"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-runner-${{ inputs.environment }}-${{ inputs.suite_name || 'Sanity' }}
+  cancel-in-progress: false
+
+jobs:
+  execute-suite:
+    name: ${{ inputs.suite_name || 'Sanity' }} Tests (${{ inputs.environment }})
+    runs-on: ${{ vars.SANITY_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+    outputs:
+      status: ${{ steps.summary.outputs.status || 'ERROR' }}
+      gate: ${{ steps.summary.outputs.gate || 'BLOCKED' }}
+    env:
+      TARGET_ENV: ${{ inputs.environment }}
+      BASE_URL: ${{ inputs.base_url || vars.BASE_URL || 'http://localhost:3000' }}
+      HEALTH_PATH: ${{ vars.HEALTH_PATH || '/api/health' }}
+      SANITY_USER: ${{ secrets.SANITY_USER || 'testuser' }}
+      SANITY_PASSWORD: ${{ secrets.SANITY_PASSWORD || 'Password123!' }}
+      TEST_SUITE_NAME: ${{ inputs.suite_name || 'Sanity' }}
+      CI: "true"
+
+    steps:
+      - name: Checkout deployed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for application availability
+        id: wait
+        run: |
+          echo "Evaluating availability for $TARGET_ENV at $BASE_URL"
+          if [[ "$BASE_URL" == http://localhost* ]] || [[ "$BASE_URL" == http://127.0.0.1* ]]; then
+            echo "Localhost target detected; Playwright webServer handles startup."
+            echo "reachable=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$BASE_URL" ]; then
+            for i in $(seq 1 20); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 10 "$BASE_URL" || true)
+              if [ "${code:-0}" -ge 200 ] && [ "${code:-0}" -lt 500 ]; then
+                echo "Endpoint reachable (HTTP $code)"; echo "reachable=true" >> "$GITHUB_OUTPUT"; exit 0
+              fi
+              echo "Attempt $i: HTTP $code, retrying in 15s..."; sleep 15
+            done
+          fi
+          echo "reachable=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::Application not reachable after wait period; running tests to capture failure details"
+
+      - name: Execute Playwright suite
+        id: test_run
+        continue-on-error: true
+        run: npx playwright test --grep "${{ inputs.test_suite || '@sanity' }}"
+
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.suite_name || 'test' }}-report-${{ inputs.environment }}-${{ github.run_number }}
+          path: |
+            playwright-report/
+            test-results/
+            results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Generate summary report & gate decision
+        id: summary
+        if: always()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
+          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          TRIGGERED_BY: ${{ github.actor }}
+          APP_REACHABLE: ${{ steps.wait.outputs.reachable }}
+          GATE_MODE: ${{ vars.SANITY_GATE_MODE || 'critical' }}
+          TEST_SUITE_NAME: ${{ inputs.suite_name || 'Sanity' }}
+        run: node scripts/build-report.mjs results/results.json
+
+      - name: Publish GitHub step summary
+        if: always()
+        run: cat email-body.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Send Email Report (when SMTP configured)
+        if: always() && secrets.SMTP_SERVER != '' && vars.SANITY_EMAIL_RECIPIENTS != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT || '587' }}
+          secure: ${{ secrets.SMTP_PORT == '465' }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ vars.SANITY_EMAIL_FROM || secrets.SMTP_USERNAME }}
+          to: ${{ vars.SANITY_EMAIL_RECIPIENTS }}
+          subject: ${{ steps.summary.outputs.subject }}
+          body: ${{ steps.summary.outputs.subject }}. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          html_body: file://email-body.html
+
+      - name: Informational notice if SMTP is unconfigured
+        if: always() && (secrets.SMTP_SERVER == '' || vars.SANITY_EMAIL_RECIPIENTS == '')
+        run: |
+          echo "::notice::SMTP secrets (SMTP_SERVER, SMTP_USERNAME, etc.) or SANITY_EMAIL_RECIPIENTS variable are not yet set. Live email dispatch was skipped. Full test summary is published above in Job Summary and stored in run artifacts."
+
+      - name: Enforce Promotion Gate
+        if: always() && steps.summary.outputs.gate != 'OPEN'
+        run: |
+          echo "::error::Promotion Gate BLOCKED! Critical test scenario(s) failed or suite did not produce results. Pipeline blocked from promoting to next environment."
+          exit 1
+
+      - name: Non-blocking warning notification
+        if: always() && steps.summary.outputs.gate == 'OPEN' && steps.summary.outputs.status == 'FAIL'
+        run: |
+          echo "::warning::Non-critical test scenarios failed. Promotion is ALLOWED, but review the report."
