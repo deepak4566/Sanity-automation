@@ -83,6 +83,12 @@ jobs:
       SANITY_USER: ${{ secrets.SANITY_USER || 'testuser' }}
       SANITY_PASSWORD: ${{ secrets.SANITY_PASSWORD || 'Password123!' }}
       TEST_SUITE_NAME: ${{ inputs.suite_name || 'Sanity' }}
+      SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      SANITY_EMAIL_RECIPIENTS: ${{ vars.SANITY_EMAIL_RECIPIENTS }}
+      SANITY_EMAIL_FROM: ${{ vars.SANITY_EMAIL_FROM }}
       CI: "true"
 
     steps:
@@ -160,22 +166,22 @@ jobs:
         run: cat email-body.md >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Send Email Report (when SMTP configured)
-        if: always() && secrets.SMTP_SERVER != '' && vars.SANITY_EMAIL_RECIPIENTS != ''
+        if: always() && env.SMTP_SERVER != '' && env.SANITY_EMAIL_RECIPIENTS != ''
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT || '587' }}
-          secure: ${{ secrets.SMTP_PORT == '465' }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: ${{ vars.SANITY_EMAIL_FROM || secrets.SMTP_USERNAME }}
-          to: ${{ vars.SANITY_EMAIL_RECIPIENTS }}
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          secure: ${{ env.SMTP_PORT == '465' }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          from: ${{ env.SANITY_EMAIL_FROM || env.SMTP_USERNAME }}
+          to: ${{ env.SANITY_EMAIL_RECIPIENTS }}
           subject: ${{ steps.summary.outputs.subject }}
           body: ${{ steps.summary.outputs.subject }}. See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           html_body: file://email-body.html
 
       - name: Informational notice if SMTP is unconfigured
-        if: always() && (secrets.SMTP_SERVER == '' || vars.SANITY_EMAIL_RECIPIENTS == '')
+        if: always() && (env.SMTP_SERVER == '' || env.SANITY_EMAIL_RECIPIENTS == '')
         run: |
           echo "::notice::SMTP secrets (SMTP_SERVER, SMTP_USERNAME, etc.) or SANITY_EMAIL_RECIPIENTS variable are not yet set. Live email dispatch was skipped. Full test summary is published above in Job Summary and stored in run artifacts."
 
