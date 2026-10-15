@@ -33,8 +33,8 @@ let orders = [
   { id: 'ORD-8842', date: '2026-10-12', itemsCount: 1, total: 79.99, status: 'Processing' }
 ];
 
-// Demo failure simulation flag (default set to 'critical_checkout' to demonstrate promotion gate blocking)
-let simulationMode = process.env.SIMULATE_FAILURE || 'critical_checkout'; // 'none' | 'critical_checkout' | 'critical'
+// Demo failure simulation flag (can be toggled for pipeline gate testing)
+let simulationMode = process.env.SIMULATE_FAILURE || 'none'; // 'none' | 'critical' | 'noncritical'
 
 // Middleware for demo auth check
 const getAuthUser = (req) => {
