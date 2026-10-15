@@ -33,24 +33,22 @@ This standalone demo repository demonstrates the complete, automated DevOps solu
 
 ```mermaid
 flowchart TD
-    A[Push to main / PR Merge] --> B[Job: Build & Syntax Check]
-    B --> C[Job: Deploy to QA Environment]
-    C --> D[Job: Sanity QA Playwright Suite]
+    A[Push to main branch] --> B[Job: Build & Syntax Check]
+    B --> C[Job: Pre-Deploy Sanity Gate]
     
-    subgraph D [Post-Deploy Sanity Evaluation]
-        D1[Wait for QA App Availability] --> D2[Run @sanity Tests]
-        D2 --> D3[Upload HTML Report, Traces, Video]
-        D3 --> D4[Build HTML & Markdown Summary]
-        D4 --> D5[Send Email Notification to Stakeholders]
-        D5 --> D6{Promotion Gate Decision}
+    subgraph C [Sanity Gate Evaluation]
+        C1[Start Demo App Server] --> C2[Execute 10 @sanity Tests]
+        C2 --> C3[Upload HTML Report, Traces, Video]
+        C3 --> C4[Generate Email HTML & Step Summary]
+        C4 --> C5[Dispatch Stakeholder Email Notification]
+        C5 --> C6{Promotion Gate Decision}
     end
     
-    D6 -- "@critical Scenario Failed" --> X[❌ PROMOTION BLOCKED<br/>Pipeline Fails & Stops]
-    D6 -- "All @critical Scenarios Passed" --> E[Job: Deploy to Staging]
-    E --> F[Job: Sanity Staging Suite]
-    F --> G{Staging Gate Decision}
-    G -- "@critical Failed" --> Y[❌ PROMOTION BLOCKED<br/>Stops Before Production]
-    G -- "All Passed" --> H[Job: Deploy to Production<br/>Optional Required Reviewers]
+    C6 -- "Any @critical Scenario Fails" --> X[❌ PROMOTION BLOCKED<br/>Pipeline Fails & Stops<br/>Merge to 'qa' Branch is BLOCKED]
+    C6 -- "All @critical Scenarios Pass" --> D[Job: Deploy to QA<br/>git merge main -> qa branch<br/>git push origin qa]
+
+    CRON1["Daily Cron (0 6 * * *)"] -.-> SMOKE["Daily Smoke Suite (@smoke)"]
+    CRON2["Weekly Cron (0 0 * * 0)"] -.-> REGR["Weekly Regression Suite (@regression)"]
 ```
 
 ---

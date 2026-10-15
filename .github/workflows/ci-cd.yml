@@ -1,12 +1,13 @@
-# Full CI/CD Pipeline with Automated Post-Deploy QA Sanity & Promotion Gate
+# CI/CD Pipeline: Pre-Deploy Sanity Gate & Automated QA Branch Promotion
 #
 # Execution Flow:
-#   push (main) -> build -> deploy-qa -> sanity-qa ──[gate]──► deploy-staging -> sanity-staging ──[gate]──► deploy-prod
-#                                           │
-#                                           ├─► Playwright @sanity suite
-#                                           ├─► HTML report / traces / video artifacts
-#                                           ├─► Email report (PASS / FAIL / BLOCKED)
-#                                           └─► Enforces gate: any @critical failure BLOCKS promotion
+#   push (main) ──► build ──► sanity-gate ──[PROMOTION GATE]──► deploy-qa (merge main -> qa branch)
+#                                │                                      ▲
+#                                │                                      │ (ONLY executes if gate is OPEN)
+#                                ├─► Playwright @sanity suite           │
+#                                ├─► HTML report / traces / video       │
+#                                ├─► Email report (PASS / FAIL)         │
+#                                └─► If @critical fails: BLOCKS MERGE ──┘
 #
 name: CI/CD Pipeline
 
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: cicd-${{ github.ref }}
@@ -42,89 +43,57 @@ jobs:
       - name: Validate code syntax
         run: node -c src/server.js scripts/build-report.mjs
 
-  deploy-qa:
-    name: Deploy to QA
+  # 1. Run Sanity Suite FIRST before promoting or merging to QA
+  sanity-gate:
+    name: Pre-Deploy Sanity Gate
     needs: build
-    runs-on: ubuntu-latest
-    environment: qa
-    outputs:
-      url: ${{ steps.deploy.outputs.url }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy QA Application
-        id: deploy
-        run: |
-          echo "Simulating deployment of commit ${{ github.sha }} to QA environment..."
-          # If an external QA URL is defined in repo/environment variables, output it.
-          # Otherwise default to http://localhost:3000 where Playwright starts the demo server.
-          TARGET="${{ vars.BASE_URL }}"
-          if [ -z "$TARGET" ]; then
-            TARGET="http://localhost:3000"
-          fi
-          echo "url=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "Successfully deployed to QA: $TARGET"
-
-  # Triggered automatically after QA deployment
-  sanity-qa:
-    name: QA Post-Deploy Sanity
-    needs: deploy-qa
     uses: ./.github/workflows/post-deploy-sanity.yml
     with:
       environment: qa
-      base_url: ${{ needs.deploy-qa.outputs.url }}
+      base_url: "http://localhost:3000"
       test_suite: "@sanity"
       suite_name: "Sanity"
       ref: ${{ github.sha }}
     secrets: inherit
 
-  # Promotion to Staging is BLOCKED if sanity-qa fails its gate
-  deploy-staging:
-    name: Deploy to Staging
-    needs: sanity-qa
+  # 2. Deploy to QA (merges main into qa branch) ONLY IF all sanity tests passed
+  deploy-qa:
+    name: Deploy to QA (Merge to QA Branch)
+    needs: sanity-gate
     runs-on: ubuntu-latest
-    environment: staging
-    outputs:
-      url: ${{ steps.deploy.outputs.url }}
+    environment: qa
     steps:
-      - name: Checkout code
+      - name: Checkout code (full commit history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Deploy Staging Application
-        id: deploy
+      - name: Configure Git Bot
         run: |
-          echo "Sanity gate PASSED. Promoting commit ${{ github.sha }} to STAGING..."
-          TARGET="${{ vars.BASE_URL }}"
-          if [ -z "$TARGET" ]; then
-            TARGET="http://localhost:3000"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge main into qa branch and push
+        run: |
+          echo "================================================================"
+          echo "✅ All Sanity tests PASSED! Promoting ${{ github.sha }} to QA..."
+          echo "================================================================"
+          
+          git fetch origin
+          
+          # Check out or create qa branch
+          if git show-ref --verify --quiet refs/remotes/origin/qa; then
+            git checkout qa
+            git pull origin qa
+          else
+            git checkout -b qa
           fi
-          echo "url=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "Successfully deployed to Staging: $TARGET"
-
-  sanity-staging:
-    name: Staging Post-Deploy Sanity
-    needs: deploy-staging
-    uses: ./.github/workflows/post-deploy-sanity.yml
-    with:
-      environment: staging
-      base_url: ${{ needs.deploy-staging.outputs.url }}
-      test_suite: "@sanity"
-      suite_name: "Sanity"
-      ref: ${{ github.sha }}
-    secrets: inherit
-
-  # Production deployment: requires staging sanity pass (+ optional environment manual reviewer approval)
-  deploy-prod:
-    name: Deploy to Production
-    needs: sanity-staging
-    runs-on: ubuntu-latest
-    environment: prod
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Deploy Production Application
-        run: |
-          echo "Staging sanity gate PASSED. Promoting commit ${{ github.sha }} to PRODUCTION..."
-          echo "Production deployment completed successfully."
+          
+          # Merge main (the verified commit) into qa branch
+          git merge ${{ github.sha }} -m "deploy: promote commit ${{ github.sha }} to QA branch [sanity passed]"
+          
+          # Push the updated qa branch
+          git push origin qa
+          
+          echo "🚀 Successfully merged to 'qa' branch and deployed to QA environment!"
