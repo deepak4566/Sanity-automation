@@ -1,0 +1,136 @@
+# Post-deploy QA sanity suite
+# Runs the Playwright @sanity tests against a freshly deployed environment
+# and emails a PASS/FAIL report to the configured recipients.
+#
+# Three ways to trigger it:
+#   1. workflow_call      -> add a job to your deploy workflow (recommended, see README)
+#   2. workflow_run       -> fires automatically when the "Deploy" workflow finishes
+#   3. workflow_dispatch  -> manual run from the Actions tab
+name: Post-Deploy Sanity
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment that was just deployed (dev / qa / staging / prod)"
+        required: true
+        type: string
+      base_url:
+        description: "URL of the deployed app. Falls back to the environment's BASE_URL variable."
+        required: false
+        type: string
+        default: ""
+    # Secrets come from the caller via `secrets: inherit`
+
+  # Option B: zero-touch trigger. Uncomment ONLY if you are NOT using workflow_call
+  # from the deploy workflow, otherwise sanity will run twice per deploy.
+  # workflow_run:
+  #   workflows: ["Deploy"]   # exact `name:` of your deploy workflow(s)
+  #   types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to test"
+        required: true
+        default: "qa"
+        type: choice
+        options: [dev, qa, staging, prod]
+      base_url:
+        description: "Override URL (optional)"
+        required: false
+        default: ""
+
+concurrency:
+  group: sanity-${{ inputs.environment || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  sanity:
+    # Skip workflow_run events where the deploy itself failed
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment || vars.DEFAULT_SANITY_ENV || 'qa' }}
+    env:
+      TARGET_ENV: ${{ inputs.environment || vars.DEFAULT_SANITY_ENV || 'qa' }}
+      BASE_URL: ${{ inputs.base_url || vars.BASE_URL }}
+      SANITY_USER: ${{ secrets.SANITY_USER }}
+      SANITY_PASSWORD: ${{ secrets.SANITY_PASSWORD }}
+      CI: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Wait for deployment to be reachable
+        run: |
+          echo "Target: $TARGET_ENV -> $BASE_URL"
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL" || true)
+            if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then echo "Up ($code)"; exit 0; fi
+            echo "Attempt $i: HTTP $code, retrying in 15s"; sleep 15
+          done
+          echo "::warning::App not reachable after 5 min; running tests anyway so the failure is reported"
+
+      - name: Run sanity suite
+        id: tests
+        continue-on-error: true
+        run: npx playwright test --grep @sanity
+
+      - name: Upload HTML report
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanity-report-${{ env.TARGET_ENV }}-${{ github.run_number }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+      - name: Build email summary
+        id: summary
+        if: always()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          TRIGGERED_BY: ${{ github.actor }}
+        run: node scripts/build-report.mjs results/results.json
+
+      - name: Email report
+        if: always() && steps.summary.outputs.status != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          secure: ${{ secrets.SMTP_PORT == '465' }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ vars.SANITY_EMAIL_FROM || secrets.SMTP_USERNAME }}
+          to: ${{ vars.SANITY_EMAIL_RECIPIENTS }}
+          subject: ${{ steps.summary.outputs.subject }}
+          html_body: file://email-body.html
+
+      - name: Write job summary
+        if: always()
+        run: cat email-body.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Fail the job if sanity failed
+        if: steps.summary.outputs.status != 'PASS'
+        run: |
+          echo "Sanity status: ${{ steps.summary.outputs.status }}"
+          exit 1

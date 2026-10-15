@@ -1,0 +1,35 @@
+# EXAMPLE ONLY — shows how to hook the sanity suite into your existing deploy workflow.
+# Copy the `sanity` job into your real deploy workflow (don't commit this file as-is).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, qa, staging, prod]
+        default: qa
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'qa' }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: deploy
+        run: |
+          echo "...your existing deploy steps..."
+          echo "url=${{ vars.BASE_URL }}" >> "$GITHUB_OUTPUT"
+
+  # ---- add this job ----
+  sanity:
+    needs: deploy
+    uses: ./.github/workflows/post-deploy-sanity.yml
+    with:
+      environment: ${{ inputs.environment || 'qa' }}
+      base_url: ${{ needs.deploy.outputs.url }}
+    secrets: inherit

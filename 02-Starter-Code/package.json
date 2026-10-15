@@ -1,0 +1,13 @@
+{
+  "name": "qa-sanity-suite",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sanity": "playwright test --grep @sanity",
+    "report:email": "node scripts/build-report.mjs results/results.json"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^20.14.0"
+  }
+}
