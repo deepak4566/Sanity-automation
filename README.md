@@ -1,4 +1,4 @@
-hi # 🚀 QA Sanity, Daily Smoke & Weekly Regression CI/CD Automation Platform
+# 🚀 QA Sanity, Daily Smoke & Weekly Regression CI/CD Automation Platform
 
 [![CI/CD Pipeline](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-blue?logo=githubactions)](.github/workflows/ci-cd.yml)
 [![Playwright](https://img.shields.io/badge/Playwright-v1.50+-green?logo=playwright)](https://playwright.dev/)
