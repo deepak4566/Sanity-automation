@@ -1,0 +1,461 @@
+name: Microservices Windows CI/CD
+ run-name: Microservices deploy — ${{ github.actor }} — ${{ github.event.inputs.DeployEnvironment }} — ${{ github.event.inputs.Service }}
+
+# Single workflow for all microservices (and other Windows .NET apps) — qa vs prod via DeployEnvironment.
+ # Service list and paths: .github/config/windows-deploy-mapping.{qa|cs-live|cs-care-live|cs-training|cs-care-training|whitsons-training|whitsons-prod}.json
+ #
+ # Branches: resolve/deploy scripts use WORKFLOW_SCRIPTS_REF (branch you run the workflow from).
+ # dotnet build/test/publish uses WINDOWS_BUILD_BRANCH (branch input, or qa Development_DotNet8, training CulinarySuite2Training, live CulinarySuite2Production).
+ #
+ # Repo variables (Settings → Secrets and variables → Actions):
+ # DEPLOY_ALLOWED_ACTORS_JSON — optional, e.g. {"qa":["user1"],"training":["user1"],"prod":["user1"]}
+ # cs-training and cs-care-training use the training list; cs-live and cs-care-live use the prod list.
+ # PROD_WINDOWS_RUNNER — optional prod runner label when Server input is empty
+ #
+ # deployType per service: iis | taskScheduler | windowsService (legacy) | folder
+ # IIS microservices: deploy-windows.ps1 stops app pool, backs up live folder, copies and replaces published files (does not delete existing folders or files), restarts IIS.
+ # appsettings.json, appsettings.*.json, and web.config already on the server are not overwritten (copied only if missing).
+ # taskScheduler: disables task before copy, enables + runs after deploy (see RecipeTelemetry.V2.Worker).
+ # testProjectPath (required for IIS APIs): dotnet test before publish; deploy blocked on failure.
+
+env:
+ # Application source: branch input, or qa Development_DotNet8, training CulinarySuite2Training, live CulinarySuite2Production.
+ WINDOWS_BUILD_BRANCH: ${{ github.event.inputs.branch || (contains(fromJSON('["cs-live","cs-care-live","whitsons-prod"]'), github.event.inputs.DeployEnvironment) && 'CulinarySuite2Production' || (contains(fromJSON('["cs-training","cs-care-training","whitsons-training"]'), github.event.inputs.DeployEnvironment) && 'CulinarySuite2Training' || 'Development_DotNet8')) }}
+ # CI/CD scripts + deploy mapping: branch selected when running this workflow (workflow file ref).
+ WORKFLOW_SCRIPTS_REF: ${{ github.ref }}
+
+on:
+ workflow_dispatch:
+ inputs:
+ DeployEnvironment:
+ type: choice
+ description: Selects windows-deploy-mapping JSON (qa, cs-live, cs-care-live, cs-training, cs-care-training, whitsons-training, whitsons-prod)
+ required: true
+ default: qa
+ options:
+ - qa
+ - cs-training
+ - cs-care-training
+ - whitsons-training
+ - cs-live
+ - cs-care-live
+ - whitsons-prod
+ Service:
+ type: choice
+ description: Service key from windows-deploy-mapping JSON (add new entries in mapping files when extending)
+ required: true
+ default: CulinarySuite.Microservices.Report.Api
+ options:
+ - CulinarySuite.Microservices.AI.Signal.Api
+ - CulinarySuite.Microservices.JwtAuth.Api
+ - CulinarySuite.Microservices.Master.Api
+ - CulinarySuite.Microservices.MasterManagement.Api
+ - CulinarySuite.Microservices.MealPlanner.Api
+ - CulinarySuite.Microservices.MetadataConfiguration.Api
+ - CulinarySuite.Microservices.Report.Api
+ - RecipeTelemetry.V2.Worker
+ branch:
+ type: string
+ description: 'Branch to build. Empty → qa Development_DotNet8, training CulinarySuite2Training, live CulinarySuite2Production.'
+ required: false
+ default: ''
+ Server:
+ type: string
+ description: '(Optional) Override self-hosted runner label from mapping'
+ required: false
+ default: ''
+ SkipDeploy:
+ type: boolean
+ description: Build and upload artifact only (no deploy)
+ required: false
+ default: false
+ RunSonar:
+ type: boolean
+ description: Run SonarQube analysis during build (requires SONAR_HOST_URL and SONAR_TOKEN secrets)
+ required: false
+ default: false
+
+jobs:
+ verify-deploy-access:
+ runs-on: ubuntu-latest
+ steps:
+ - name: Verify deploy is allowed for this GitHub user
+ shell: bash
+ env:
+ DEPLOY_ALLOWED_ACTORS_JSON: ${{ vars.DEPLOY_ALLOWED_ACTORS_JSON }}
+ DEPLOY_ENV: ${{ github.event.inputs.DeployEnvironment }}
+ GITHUB_ACTOR_LOCAL: ${{ github.actor }}
+ run: |
+ python3 << 'PY'
+ import json, os, sys
+ raw = (os.environ.get("DEPLOY_ALLOWED_ACTORS_JSON") or "").strip()
+ env_key = (os.environ.get("DEPLOY_ENV") or "").strip()
+ actor = (os.environ.get("GITHUB_ACTOR_LOCAL") or "").strip()
+ if not raw:
+ print("::notice title=Deploy ACL::DEPLOY_ALLOWED_ACTORS_JSON is not set; any user who can run this workflow may deploy.")
+ sys.exit(0)
+ try:
+ data = json.loads(raw)
+ except json.JSONDecodeError as e:
+ print(f"::error::Invalid JSON in DEPLOY_ALLOWED_ACTORS_JSON: {e}")
+ sys.exit(1)
+ aliases = {
+ "cs-training": "training",
+ "cs-care-training": "training",
+ "cs-live": "prod",
+ "cs-care-live": "prod",
+ }
+ acl_key = env_key if env_key in data else aliases.get(env_key, env_key)
+ if acl_key not in data:
+ print(f"::error::DeployEnvironment {env_key!r} is not a key in DEPLOY_ALLOWED_ACTORS_JSON.")
+ sys.exit(1)
+ if acl_key != env_key:
+ print(f"DeployEnvironment {env_key} uses allow-list key {acl_key}")
+ allowed = data[acl_key] or []
+ if not isinstance(allowed, list):
+ print(f"::error::Value for {acl_key!r} must be a JSON array.")
+ sys.exit(1)
+ names = [x.strip() for x in allowed if isinstance(x, str) and x.strip()]
+ if any(n.lower() == actor.lower() for n in names):
+ print(f"Deploy allowed for github.actor={actor}")
+ sys.exit(0)
+ print(f"::error::Deploy denied for github.actor={actor!r}. Allowed: {names!r}")
+ sys.exit(1)
+ PY
+
+ resolve-windows-deploy:
+ name: Resolve deploy mapping
+ runs-on: ubuntu-latest
+ needs: verify-deploy-access
+ outputs:
+ targets: ${{ steps.resolve.outputs.targets }}
+ runner_label: ${{ steps.resolve.outputs.runner_label }}
+ project_path: ${{ steps.resolve.outputs.project_path }}
+ test_project_path: ${{ steps.resolve.outputs.test_project_path }}
+ project_dir: ${{ steps.resolve.outputs.project_dir }}
+ publish_path: ${{ steps.resolve.outputs.publish_path }}
+ primary_deploy_path: ${{ steps.resolve.outputs.primary_deploy_path }}
+ backup_root: ${{ steps.resolve.outputs.backup_root }}
+ deploy_type: ${{ steps.resolve.outputs.deploy_type }}
+ dotnet_version: ${{ steps.resolve.outputs.dotnet_version }}
+ steps:
+ - name: Checkout CI/CD scripts and deploy mapping
+ uses: actions/checkout@v4
+ with:
+ ref: ${{ env.WORKFLOW_SCRIPTS_REF }}
+ sparse-checkout: |
+ .github/config
+ .github/scripts
+
+ - name: Resolve Windows deployment mapping
+ id: resolve
+ shell: pwsh
+ env:
+ SERVICE_NAME: ${{ github.event.inputs.Service }}
+ DEPLOY_ENVIRONMENT: ${{ github.event.inputs.DeployEnvironment }}
+ WRITE_RESOLVE_GITHUB_OUTPUT: '1'
+ run: |
+ Write-Host "Using workflow ref for scripts/mapping: $env:WORKFLOW_SCRIPTS_REF"
+ Write-Host "Application build branch (later jobs): $env:WINDOWS_BUILD_BRANCH"
+ $script = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/resolve-windows-deploy-targets.ps1'
+ if (-not (Test-Path -LiteralPath $script)) {
+ throw "Deploy resolve script not found at $script (workflow ref $env:WORKFLOW_SCRIPTS_REF)."
+ }
+ & $script
+
+ - name: Upload deployment scripts
+ uses: actions/upload-artifact@v4
+ with:
+ name: windows-github-scripts
+ path: .github/scripts
+ retention-days: 1
+
+ - name: Upload deploy manifest
+ uses: actions/upload-artifact@v4
+ with:
+ name: windows-deploy-config
+ path: .github/ci-outputs/windows-deploy-manifest.json
+ retention-days: 1
+ if-no-files-found: error
+
+ build-windows:
+ runs-on: windows-latest
+ needs:
+ - verify-deploy-access
+ - resolve-windows-deploy
+ steps:
+ - name: Pre-checkout
+ run: git config --system core.longpaths true
+
+ - name: Checkout application source
+ uses: actions/checkout@v4
+ with:
+ ref: ${{ env.WINDOWS_BUILD_BRANCH }}
+
+ - uses: actions/setup-dotnet@v4
+ with:
+ dotnet-version: ${{ needs.resolve-windows-deploy.outputs.dotnet_version || '8.0.x' }}
+
+ - name: Pin .NET 8 SDK
+ shell: powershell
+ run: |
+ @'
+ {
+ "sdk": {
+ "version": "8.0.100",
+ "rollForward": "latestFeature"
+ }
+ }
+ '@ | Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE "global.json") -Encoding ascii
+ Write-Host "Installed SDKs:"
+ dotnet --list-sdks
+ Write-Host "Selected SDK: $(dotnet --version)"
+
+ - name: Set build paths
+ id: path
+ shell: powershell
+ run: |
+ $workspace = "${{ github.workspace }}"
+ $projectPath = "${{ needs.resolve-windows-deploy.outputs.project_path }}"
+ $fullProject = Join-Path $workspace $projectPath
+ $projectDir = Split-Path $fullProject -Parent
+ $publishPath = Join-Path $workspace "${{ needs.resolve-windows-deploy.outputs.publish_path }}"
+ echo "PROJECT_FILE=$fullProject" >> $env:GITHUB_OUTPUT
+ echo "PROJECT_DIR=$projectDir" >> $env:GITHUB_OUTPUT
+ echo "PUBLISH_PATH=$publishPath" >> $env:GITHUB_OUTPUT
+
+ - name: Clean Release artifacts
+ shell: powershell
+ run: |
+ $project = "${{ steps.path.outputs.PROJECT_FILE }}"
+ Write-Host "Cleaning: $project"
+ dotnet clean $project --configuration Release
+ if ($LASTEXITCODE -ne 0) { throw "dotnet clean failed (exit $LASTEXITCODE)" }
+
+ $testProjectRel = "${{ needs.resolve-windows-deploy.outputs.test_project_path }}"
+ if ($testProjectRel) {
+ $testProject = Join-Path "${{ github.workspace }}" $testProjectRel
+ if (Test-Path -LiteralPath $testProject) {
+ Write-Host "Cleaning tests: $testProject"
+ dotnet clean $testProject --configuration Release
+ if ($LASTEXITCODE -ne 0) { throw "dotnet clean (tests) failed (exit $LASTEXITCODE)" }
+ }
+ }
+
+ $publishPath = "${{ steps.path.outputs.PUBLISH_PATH }}"
+ if (Test-Path -LiteralPath $publishPath) {
+ Write-Host "Removing stale publish folder: $publishPath"
+ Remove-Item -LiteralPath $publishPath -Recurse -Force
+ }
+
+ - name: Run unit tests
+ if: ${{ needs.resolve-windows-deploy.outputs.test_project_path != '' }}
+ shell: powershell
+ run: |
+ $testProject = Join-Path "${{ github.workspace }}" "${{ needs.resolve-windows-deploy.outputs.test_project_path }}"
+ if (-not (Test-Path -LiteralPath $testProject)) {
+ throw "Test project not found: $testProject"
+ }
+ $resultsDir = Join-Path $env:GITHUB_WORKSPACE "TestResults"
+ New-Item -Path $resultsDir -ItemType Directory -Force | Out-Null
+ Write-Host "Running unit tests: $testProject"
+ dotnet test $testProject `
+ --configuration Release `
+ --verbosity normal `
+ --logger "console;verbosity=normal" `
+ --logger "trx;LogFileName=unit-tests.trx" `
+ --results-directory $resultsDir
+ if ($LASTEXITCODE -ne 0) {
+ $trx = Get-ChildItem -Path $resultsDir -Filter *.trx -ErrorAction SilentlyContinue |
+ Sort-Object LastWriteTime -Descending |
+ Select-Object -First 1
+ if ($trx) {
+ [xml]$report = Get-Content -LiteralPath $trx.FullName
+ $ns = New-Object System.Xml.XmlNamespaceManager($report.NameTable)
+ $ns.AddNamespace("t", "http://microsoft.com/schemas/VisualStudio/TeamTest/2010")
+ foreach ($result in $report.SelectNodes("//t:UnitTestResult[@outcome='Failed']", $ns)) {
+ Write-Host "FAILED: $($result.testName)"
+ $message = $result.Output.ErrorInfo.Message
+ if ($message) { Write-Host $message }
+ }
+ }
+ throw "Unit tests failed (exit $LASTEXITCODE). Deploy blocked."
+ }
+
+ - name: Upload unit test results
+ if: always() && needs.resolve-windows-deploy.outputs.test_project_path != ''
+ uses: actions/upload-artifact@v4
+ with:
+ name: ${{ github.event.inputs.Service }}_UnitTestResults
+ path: TestResults/*.trx
+ retention-days: 14
+ if-no-files-found: ignore
+
+ - name: Cache SonarQube packages
+ if: ${{ github.event.inputs.RunSonar == 'true' }}
+ uses: actions/cache@v4
+ with:
+ path: C:\Users\runneradmin\.sonar\cache
+ key: ${{ runner.os }}-sonar
+ restore-keys: ${{ runner.os }}-sonar
+
+ - name: Cache SonarQube scanner
+ if: ${{ github.event.inputs.RunSonar == 'true' }}
+ id: cache-sonar-scanner
+ uses: actions/cache@v4
+ with:
+ path: .\.sonar\scanner
+ key: ${{ runner.os }}-sonar-scanner
+ restore-keys: ${{ runner.os }}-sonar-scanner
+
+ - name: Install SonarQube scanner
+ if: ${{ github.event.inputs.RunSonar == 'true' && steps.cache-sonar-scanner.outputs.cache-hit != 'true' }}
+ run: |
+ New-Item -Path .\.sonar\scanner -ItemType Directory -Force
+ dotnet tool update dotnet-sonarscanner --tool-path .\.sonar\scanner
+
+ - name: Sonar Analysis
+ if: ${{ github.event.inputs.RunSonar == 'true' }}
+ run: |
+ .\.sonar\scanner\dotnet-sonarscanner begin /k:${{ github.event.inputs.Service }} /n:${{ github.event.inputs.Service }} /d:sonar.host.url=${{ secrets.SONAR_HOST_URL }} /d:sonar.login=${{ secrets.SONAR_TOKEN }}
+ dotnet build "${{ steps.path.outputs.PROJECT_FILE }}" --configuration Release
+ .\.sonar\scanner\dotnet-sonarscanner end /d:sonar.login=${{ secrets.SONAR_TOKEN }}
+
+ - name: Publish
+ shell: powershell
+ env:
+ DEPLOY_TYPE: ${{ needs.resolve-windows-deploy.outputs.deploy_type }}
+ run: |
+ $project = "${{ steps.path.outputs.PROJECT_FILE }}"
+ $publishPath = "${{ steps.path.outputs.PUBLISH_PATH }}"
+ New-Item -Path $publishPath -ItemType Directory -Force | Out-Null
+
+ $publishArgs = @(
+ 'publish', $project,
+ '--configuration', 'Release',
+ '--output', $publishPath,
+ '--verbosity', 'minimal'
+ )
+
+ # Task Scheduler hosts often lack the .NET 8 runtime; self-contained avoids immediate exe exit.
+ if ($env:DEPLOY_TYPE -eq 'taskScheduler') {
+ Write-Host "taskScheduler deploy: self-contained win-x64 publish"
+ $publishArgs += @('-r', 'win-x64', '--self-contained', 'true', '/p:PublishSingleFile=false')
+ } else {
+ Write-Host "Publish: framework-dependent (target host must have matching .NET runtime)"
+ }
+
+ dotnet @publishArgs
+ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed (exit $LASTEXITCODE)" }
+
+ if ($env:DEPLOY_TYPE -eq 'taskScheduler') {
+ $exe = Join-Path $publishPath 'RecipeTelemetry.V2.Worker.exe'
+ if (-not (Test-Path -LiteralPath $exe)) {
+ throw "Publish verification failed: $exe not found. Check Task Scheduler action path matches deployment folder."
+ }
+ Write-Host "Verified publish executable: $exe"
+ }
+
+ - name: List publish output
+ shell: powershell
+ run: |
+ $publishPath = "${{ steps.path.outputs.PUBLISH_PATH }}"
+ Write-Host "Publish folder: $publishPath"
+ Get-ChildItem -LiteralPath $publishPath | Format-Table Name, Length -AutoSize
+ $exe = Join-Path $publishPath 'RecipeTelemetry.V2.Worker.exe'
+ if ("${{ needs.resolve-windows-deploy.outputs.deploy_type }}" -eq 'taskScheduler') {
+ if (-not (Test-Path -LiteralPath $exe)) {
+ throw "Publish output missing required executable: $exe"
+ }
+ foreach ($config in @('appsettings.json', 'appsettings.Production.json')) {
+ $configPath = Join-Path $publishPath $config
+ if (Test-Path -LiteralPath $configPath) {
+ Write-Host "Config present in artifact: $config"
+ } else {
+ Write-Host "##[warning]Config not in publish artifact: $config"
+ }
+ }
+ }
+
+ - name: Upload build artifact
+ uses: actions/upload-artifact@v4
+ with:
+ name: ${{ github.event.inputs.Service }}_Artifact
+ path: ${{ steps.path.outputs.PUBLISH_PATH }}
+ retention-days: 2
+ if-no-files-found: error
+
+ outputs:
+ service_name: ${{ github.event.inputs.Service }}
+ publish_path: ${{ steps.path.outputs.PUBLISH_PATH }}
+
+ deploy-windows:
+ runs-on:
+ - self-hosted
+ - ${{ github.event.inputs.Server || needs.resolve-windows-deploy.outputs.runner_label || (contains(fromJSON('["cs-live","cs-care-live","whitsons-prod"]'), github.event.inputs.DeployEnvironment) && (vars.PROD_WINDOWS_RUNNER || 'YOUR-PROD-RUNNER-LABEL') || 'YOUR-QA-RUNNER-LABEL') }}
+ needs:
+ - build-windows
+ - resolve-windows-deploy
+ if: ${{ github.event.inputs.SkipDeploy != 'true' }}
+ steps:
+ - name: Download build artifacts
+ uses: actions/download-artifact@v4
+ with:
+ name: ${{ needs.build-windows.outputs.service_name }}_Artifact
+ path: ${{ github.workspace }}\${{ needs.build-windows.outputs.service_name }}
+
+ - name: Download deployment scripts
+ uses: actions/download-artifact@v4
+ with:
+ name: windows-github-scripts
+ path: .github/scripts
+
+ - name: Download deploy manifest
+ uses: actions/download-artifact@v4
+ with:
+ name: windows-deploy-config
+ path: .github/ci-outputs
+
+ - name: Deploy to server
+ shell: powershell
+ run: |
+ . "${{ github.workspace }}\.github\scripts\deploy-windows.ps1"
+ $manifestPath = "${{ github.workspace }}\.github\ci-outputs\windows-deploy-manifest.json"
+ $summaryTargets = Invoke-WindowsDeploy `
+ -ArtifactPath "${{ github.workspace }}\${{ needs.build-windows.outputs.service_name }}" `
+ -ServiceName "${{ needs.build-windows.outputs.service_name }}" `
+ -DeployManifestPath $manifestPath `
+ -RunNumber "${{ github.run_number }}" `
+ -ScriptsDir "${{ github.workspace }}\.github\scripts"
+ $summaryFile = Join-Path $env:GITHUB_WORKSPACE 'deploy-targets-summary.json'
+ ConvertTo-Json -InputObject @($summaryTargets) -Depth 5 | Set-Content -Path $summaryFile -Encoding utf8
+ $global:LASTEXITCODE = 0
+
+ - name: Write deployment summary
+ if: always()
+ shell: powershell
+ env:
+ SUMMARY_COMPONENT: '.NET Windows deploy'
+ SUMMARY_STATUS: ${{ job.status }}
+ run: |
+ $details = @(
+ @{ label = 'Service'; value = "${{ needs.build-windows.outputs.service_name }}" },
+ @{ label = 'Deploy type'; value = "${{ needs.resolve-windows-deploy.outputs.deploy_type }}" },
+ @{ label = 'Deploy targets'; value = "${{ needs.resolve-windows-deploy.outputs.targets }}" },
+ @{ label = 'Runner (mapped)'; value = "${{ needs.resolve-windows-deploy.outputs.runner_label }}" },
+ @{ label = 'Runner (used)'; value = "${{ github.event.inputs.Server || needs.resolve-windows-deploy.outputs.runner_label }}" },
+ @{ label = 'Environment'; value = "${{ github.event.inputs.DeployEnvironment }}" },
+ @{ label = 'Build branch'; value = "${{ env.WINDOWS_BUILD_BRANCH }}" },
+ @{ label = 'Workflow ref (scripts)'; value = "${{ env.WORKFLOW_SCRIPTS_REF }}" },
+ @{ label = 'Unit tests'; value = "${{ needs.resolve-windows-deploy.outputs.test_project_path || 'none configured' }}" },
+ @{ label = 'Triggered by'; value = "${{ github.actor }}" },
+ @{ label = 'Run'; value = "#${{ github.run_number }}" }
+ )
+ $env:SUMMARY_DETAILS_JSON = (ConvertTo-Json -InputObject @($details) -Compress)
+ $summaryFile = Join-Path $env:GITHUB_WORKSPACE 'deploy-targets-summary.json'
+ if (Test-Path $summaryFile) {
+ $env:SUMMARY_TARGETS_JSON = Get-Content -Path $summaryFile -Raw
+ } else {
+ $env:SUMMARY_TARGETS_JSON = '[]'
+ }
+ & "${{ github.workspace }}\.github\scripts\write-deployment-summary.ps1"
